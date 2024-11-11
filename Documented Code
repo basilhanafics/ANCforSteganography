@@ -1,0 +1,220 @@
+# Ensure we're using a GPU if available
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models, transforms
+from torchvision.datasets import CIFAR10
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+import torch.nn.functional as F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Function to display images
+def imshow(img, title):
+    """
+    Display an image with a title.
+
+    Args:
+        img (Tensor): Image tensor to display.
+        title (str): Title for the image display.
+    """
+    img = img / 2 + 0.5  # unnormalize
+    npimg = img.cpu().numpy()
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.title(title)
+    plt.show()
+
+# Perceptual Loss: Use VGG19 to compare high-level features
+class PerceptualLoss(nn.Module):
+    """
+    Perceptual loss to compare high-level features between the original
+    and encoded images using a pre-trained VGG19 network.
+
+    Attributes:
+        vgg (nn.Module): Pre-trained VGG19 network used to extract features.
+    """
+    def __init__(self):
+        super(PerceptualLoss, self).__init__()
+        vgg = models.vgg19(pretrained=True).features[:12].eval().to(device)
+        for param in vgg.parameters():
+            param.requires_grad = False
+        self.vgg = vgg
+
+    def forward(self, original, encoded):
+        """
+        Compute the perceptual loss between original and encoded images.
+
+        Args:
+            original (Tensor): Original cover image.
+            encoded (Tensor): Encoded image with the hidden message.
+
+        Returns:
+            Tensor: Mean squared error between features of the original and encoded images.
+        """
+        original_features = self.vgg(original)
+        encoded_features = self.vgg(encoded)
+        perceptual_loss = F.mse_loss(original_features, encoded_features)
+        return perceptual_loss
+
+# SSIM Loss Function
+def ssim_loss(img1, img2):
+    """
+    Calculate the Structural Similarity Index (SSIM) loss between two images.
+
+    Args:
+        img1 (Tensor): First image (original).
+        img2 (Tensor): Second image (encoded).
+
+    Returns:
+        Tensor: SSIM loss between the two images.
+    """
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    # Mean calculations for both images
+    mu1 = F.avg_pool2d(img1, 3, 1, 1)
+    mu2 = F.avg_pool2d(img2, 3, 1, 1)
+
+    # Variance and covariance calculations
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.avg_pool2d(img1 * img1, 3, 1, 1) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, 3, 1, 1) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, 3, 1, 1) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return 1 - ssim_map.mean()
+
+# Alice (Encoder) model to hide a message in an image
+class Alice(nn.Module):
+    """
+    Encoder model to hide a message in a cover image.
+
+    Methods:
+        forward(cover_image, secret_message): Concatenates the cover image and message,
+        and returns an encoded image.
+    """
+    def __init__(self):
+        super(Alice, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(6, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 3, kernel_size=3, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, cover_image, secret_message):
+        x = torch.cat((cover_image, secret_message), dim=1)
+        return self.encoder(x)
+
+# Bob (Decoder) model to recover the message from the encoded image
+class Bob(nn.Module):
+    """
+    Decoder model to recover the hidden message from an encoded image.
+
+    Methods:
+        forward(encoded_image): Processes the encoded image to recover the hidden message.
+    """
+    def __init__(self):
+        super(Bob, self).__init__()
+        self.decoder = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 3, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, encoded_image):
+        return self.decoder(encoded_image)
+
+# Eve (Adversary) model to detect hidden messages
+class Eve(nn.Module):
+    """
+    Adversary model to detect the presence of hidden messages in encoded images.
+
+    Methods:
+        forward(image): Predicts whether an image contains a hidden message.
+    """
+    def __init__(self):
+        super(Eve, self).__init__()
+        self.discriminator = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, image):
+        return self.discriminator(image)
+
+# Initialize the models and move to GPU if available
+alice = Alice().to(device)
+bob = Bob().to(device)
+eve = Eve().to(device)
+perceptual_loss_fn = PerceptualLoss()
+
+# Loss functions and optimizers
+criterion = nn.MSELoss()  # Loss for Alice and Bob
+adv_criterion = nn.BCELoss()  # Binary Cross-Entropy for Eve's detection
+alice_optimizer = optim.Adam(alice.parameters(), lr=0.001)
+bob_optimizer = optim.Adam(bob.parameters(), lr=0.001)
+eve_optimizer = optim.Adam(eve.parameters(), lr=0.001)
+
+# Dataset and DataLoader
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+trainset = CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = DataLoader(trainset, batch_size=32, shuffle=True)
+
+# Training Loop
+epochs = 50
+for epoch in range(epochs):
+    # Initializing loss accumulators
+    bob_loss_epoch, eve_loss_epoch, ssim_loss_epoch, perceptual_loss_epoch = 0, 0, 0, 0
+
+    for images, _ in trainloader:
+        cover_images = images.to(device)
+        secret_messages = torch.rand(images.size(0), 3, 32, 32).to(device)
+
+        # Train Alice and Bob
+        alice_optimizer.zero_grad()
+        bob_optimizer.zero_grad()
+        encoded_images = alice(cover_images, secret_messages)
+        recovered_messages = bob(encoded_images)
+        
+        # Calculate losses for message recovery, SSIM, and perceptual similarity
+        loss_bob = criterion(recovered_messages, secret_messages)
+        perceptual_loss = perceptual_loss_fn(cover_images, encoded_images)
+        ssim_loss_value = ssim_loss(cover_images, encoded_images)
+
+        # Combined loss
+        total_loss = loss_bob + 0.5 * perceptual_loss + 0.5 * ssim_loss_value
+        total_loss.backward()
+        alice_optimizer.step()
+        bob_optimizer.step()
+
+        # Accumulate losses for plotting
+        bob_loss_epoch += loss_bob.item()
+        perceptual_loss_epoch += perceptual_loss.item()
+        ssim_loss_epoch += ssim_loss_value.item()
+
+        # Train Eve
+        eve_optimizer.zero_grad()
+        real_labels, fake_labels = torch.ones(images.size(0), 1, 32, 32).to(device), torch.zeros(images.size(0), 1, 32, 32).to(device)
+        eve_real_loss = adv_criterion(eve(cover_images), real_labels)
+        eve_fake_loss = adv_criterion(eve(encoded_images.detach()), fake_labels)
+        eve_loss = (eve_real_loss + eve_fake_loss) / 2
+        eve_loss.backward()
+        eve_optimizer.step()
+        eve_loss_epoch += eve_loss.item()
+
+    # Print training progress
+    print(f'Epoch [{epoch+1}/{epochs}], Total Loss: {total_loss.item():.4f}, Eve Loss: {eve_loss.item():.4f}')
